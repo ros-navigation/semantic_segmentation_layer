@@ -194,21 +194,30 @@ void SemanticSegmentationLayer::onInitialize()
       use_cost_selection);
 
     segmentation_buffers_.push_back(segmentation_buffer);
-    
-    auto semantic_segmentation_sub =
-      std::make_shared<message_filters::Subscriber<sensor_msgs::msg::Image>>(
-        node, segmentation_topic, custom_qos_profile, sub_opt);
+
+    // Kilted+ takes rclcpp::QoS directly; pre-Kilted needs rmw_qos_profile_t and a
+    // LifecycleNode shared_ptr. SubFilter and SUB_QOS hide the version split.
+#if RCLCPP_VERSION_GTE(29, 6, 0)
+    auto& sub_node = node;
+#define SUB_QOS(q) (q)
+#else
+    auto sub_node = std::static_pointer_cast<rclcpp_lifecycle::LifecycleNode>(node);
+#define SUB_QOS(q) ((q).get_rmw_qos_profile())
+#endif
+
+    auto semantic_segmentation_sub = std::make_shared<SubFilter<sensor_msgs::msg::Image>>(
+        sub_node, segmentation_topic, SUB_QOS(custom_qos_profile), sub_opt);
     semantic_segmentation_sub->unsubscribe();
     semantic_segmentation_subs_.push_back(semantic_segmentation_sub);
 
-    auto label_info_sub = std::make_shared<message_filters::Subscriber<vision_msgs::msg::LabelInfo>>(
-        node, labels_topic, tl_qos_profile, tl_sub_opt);
+    auto label_info_sub = std::make_shared<SubFilter<vision_msgs::msg::LabelInfo>>(
+        sub_node, labels_topic, SUB_QOS(tl_qos_profile), tl_sub_opt);
     label_info_sub->registerCallback(std::bind(&SemanticSegmentationLayer::labelinfoCb, this, std::placeholders::_1, segmentation_buffers_.back()));
     label_info_sub->unsubscribe();
     label_info_subs_.push_back(label_info_sub);
 
-    auto pointcloud_sub = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::PointCloud2>>(
-      node, pointcloud_topic, custom_qos_profile, sub_opt);
+    auto pointcloud_sub = std::make_shared<SubFilter<sensor_msgs::msg::PointCloud2>>(
+      sub_node, pointcloud_topic, SUB_QOS(custom_qos_profile), sub_opt);
     pointcloud_sub->unsubscribe();
     pointcloud_subs_.push_back(pointcloud_sub);
 
@@ -221,9 +230,8 @@ void SemanticSegmentationLayer::onInitialize()
 
     if(!confidence_topic.empty())
     {
-      auto semantic_segmentation_confidence_sub =
-      std::make_shared<message_filters::Subscriber<sensor_msgs::msg::Image>>(
-        node, confidence_topic, custom_qos_profile, sub_opt);
+      auto semantic_segmentation_confidence_sub = std::make_shared<SubFilter<sensor_msgs::msg::Image>>(
+          sub_node, confidence_topic, SUB_QOS(custom_qos_profile), sub_opt);
       semantic_segmentation_confidence_sub->unsubscribe();
       semantic_segmentation_confidence_subs_.push_back(semantic_segmentation_confidence_sub);
       if (use_approximate_time_sync_)
@@ -244,9 +252,17 @@ void SemanticSegmentationLayer::onInitialize()
       }
       else
       {
+#if RCLCPP_VERSION_GTE(29, 6, 0)
+        // Kilted+ message_filters::TimeSynchronizer takes queue_size first.
+        auto segm_conf_pc_sync = std::make_shared<ExactSync3>(
+          1000,
+          *semantic_segmentation_subs_.back(), *semantic_segmentation_confidence_subs_.back(),
+          *pointcloud_tf_subs_.back());
+#else
         auto segm_conf_pc_sync = std::make_shared<ExactSync3>(
           *semantic_segmentation_subs_.back(), *semantic_segmentation_confidence_subs_.back(),
           *pointcloud_tf_subs_.back(), 1000);
+#endif
         segm_conf_pc_sync->registerCallback(std::bind(
           &SemanticSegmentationLayer::syncSegmConfPointcloudCb, this,
           std::placeholders::_1, std::placeholders::_2,
@@ -273,8 +289,14 @@ void SemanticSegmentationLayer::onInitialize()
       }
       else
       {
+#if RCLCPP_VERSION_GTE(29, 6, 0)
+        auto segm_pc_sync = std::make_shared<ExactSync2>(
+          1000,
+          *semantic_segmentation_subs_.back(), *pointcloud_tf_subs_.back());
+#else
         auto segm_pc_sync = std::make_shared<ExactSync2>(
           *semantic_segmentation_subs_.back(), *pointcloud_tf_subs_.back(), 1000);
+#endif
         segm_pc_sync->registerCallback(std::bind(
           &SemanticSegmentationLayer::syncSegmPointcloudCb, this,
           std::placeholders::_1, std::placeholders::_2, segmentation_buffers_.back()));

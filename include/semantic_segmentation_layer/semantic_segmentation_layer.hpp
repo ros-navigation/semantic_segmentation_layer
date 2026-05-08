@@ -43,6 +43,8 @@
 #include <variant>
 
 #include "rclcpp/rclcpp.hpp"
+#include "rclcpp/version.h"
+#include "rclcpp_lifecycle/lifecycle_node.hpp"
 
 #include "message_filters/subscriber.hpp"
 #include "message_filters/synchronizer.hpp"
@@ -149,14 +151,21 @@ class SemanticSegmentationLayer : public nav2_costmap_2d::CostmapLayer
     void labelinfoCb(const std::shared_ptr<const vision_msgs::msg::LabelInfo>& label_info,
                      const std::shared_ptr<semantic_segmentation_layer::SegmentationBuffer>& buffer);
 
-    std::vector<std::shared_ptr<message_filters::Subscriber<sensor_msgs::msg::Image>>>
-        semantic_segmentation_subs_;
-    std::vector<std::shared_ptr<message_filters::Subscriber<sensor_msgs::msg::Image>>>
+    // Kilted+ (rclcpp >= 29.6) infers NodeType so the second template arg is dropped;
+    // earlier distros default to rclcpp::Node and need LifecycleNode spelled out.
+#if RCLCPP_VERSION_GTE(29, 6, 0)
+    template <typename M>
+    using SubFilter = message_filters::Subscriber<M>;
+#else
+    template <typename M>
+    using SubFilter = message_filters::Subscriber<M, rclcpp_lifecycle::LifecycleNode>;
+#endif
+
+    std::vector<std::shared_ptr<SubFilter<sensor_msgs::msg::Image>>> semantic_segmentation_subs_;
+    std::vector<std::shared_ptr<SubFilter<sensor_msgs::msg::Image>>>
         semantic_segmentation_confidence_subs_;
-    std::vector<std::shared_ptr<message_filters::Subscriber<vision_msgs::msg::LabelInfo>>>
-        label_info_subs_;
-    std::vector<std::shared_ptr<message_filters::Subscriber<sensor_msgs::msg::PointCloud2>>>
-        pointcloud_subs_;
+    std::vector<std::shared_ptr<SubFilter<vision_msgs::msg::LabelInfo>>> label_info_subs_;
+    std::vector<std::shared_ptr<SubFilter<sensor_msgs::msg::PointCloud2>>> pointcloud_subs_;
     using ExactSync2 = message_filters::TimeSynchronizer<sensor_msgs::msg::Image, sensor_msgs::msg::PointCloud2>;
     using ExactSync3 = message_filters::TimeSynchronizer<sensor_msgs::msg::Image, sensor_msgs::msg::Image, sensor_msgs::msg::PointCloud2>;
     using ApproxSyncPolicy2 = message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::Image, sensor_msgs::msg::PointCloud2>;
