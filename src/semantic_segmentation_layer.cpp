@@ -64,7 +64,7 @@ void SemanticSegmentationLayer::onInitialize()
     {
         throw std::runtime_error{"Failed to lock node"};
     }
-    std::string segmentation_topic, confidence_topic, pointcloud_topic, labels_topic;
+    std::string segmentation_topic, confidence_topic, pointcloud_topic, labels_topic, sensor_frame;
     std::vector<std::string> class_types_string;
     double max_obstacle_distance, min_obstacle_distance, observation_keep_time, transform_tolerance,
         expected_update_rate, tile_map_decay_time;
@@ -108,6 +108,7 @@ void SemanticSegmentationLayer::onInitialize()
         declareParameter(source + "." + "segmentation_topic", rclcpp::ParameterValue(""));
         declareParameter(source + "." + "confidence_topic", rclcpp::ParameterValue(""));
         declareParameter(source + "." + "labels_topic", rclcpp::ParameterValue(""));
+        declareParameter(source + "." + "sensor_frame", rclcpp::ParameterValue(""));
         declareParameter(source + "." + "pointcloud_topic", rclcpp::ParameterValue(""));
         declareParameter(source + "." + "observation_persistence", rclcpp::ParameterValue(0.0));
         declareParameter(source + "." + "expected_update_rate", rclcpp::ParameterValue(0.0));
@@ -128,6 +129,7 @@ void SemanticSegmentationLayer::onInitialize()
         node->get_parameter(name_ + "." + source + "." + "segmentation_topic", segmentation_topic);
         node->get_parameter(name_ + "." + source + "." + "confidence_topic", confidence_topic);
         node->get_parameter(name_ + "." + source + "." + "labels_topic", labels_topic);
+        node->get_parameter(name_ + "." + source + "." + "sensor_frame", sensor_frame);
         node->get_parameter(name_ + "." + source + "." + "pointcloud_topic", pointcloud_topic);
         node->get_parameter(name_ + "." + source + "." + "observation_persistence", observation_keep_time);
         node->get_parameter(name_ + "." + source + "." + "expected_update_rate", expected_update_rate);
@@ -219,9 +221,10 @@ void SemanticSegmentationLayer::onInitialize()
 
         auto segmentation_buffer = std::make_shared<semantic_segmentation_layer::SegmentationBuffer>(
             node, source, class_types_string, class_map, class_type_to_names, observation_keep_time,
-            expected_update_rate, max_obstacle_distance, min_obstacle_distance, *tf_, global_frame_, "",
+            expected_update_rate, max_obstacle_distance, min_obstacle_distance, *tf_, global_frame_, sensor_frame,
             tf2::durationFromSec(transform_tolerance), getResolution(), tile_map_decay_time, visualize_tile_map,
-            use_cost_selection);
+            use_cost_selection, camera_h_fov, camera_v_fov, camera_min_dist, camera_max_dist, fov_decay_time,
+            outside_fov_decay_time, visualize_frustum_fov);
 
         segmentation_buffers_.push_back(segmentation_buffer);
 
