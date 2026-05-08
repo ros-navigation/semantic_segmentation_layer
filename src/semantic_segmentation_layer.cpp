@@ -37,8 +37,11 @@
  *********************************************************************/
 #include "semantic_segmentation_layer/semantic_segmentation_layer.hpp"
 
+#include <algorithm>
+
 #include "nav2_costmap_2d/costmap_math.hpp"
 #include "nav2_costmap_2d/footprint.hpp"
+#include "nav2_ros_common/qos_profiles.hpp"
 #include "rclcpp/parameter_events_filter.hpp"
 
 using nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE;
@@ -54,245 +57,253 @@ SemanticSegmentationLayer::SemanticSegmentationLayer() {}
 // of need_recalculation_ variable.
 void SemanticSegmentationLayer::onInitialize()
 {
-    current_ = true;
-    was_reset_ = false;
-    auto node = node_.lock();
-    if (!node)
+  current_ = true;
+  was_reset_ = false;
+  auto node = node_.lock();
+  if (!node)
+  {
+    throw std::runtime_error{"Failed to lock node"};
+  }
+  std::string segmentation_topic, confidence_topic, pointcloud_topic, labels_topic;
+  std::vector<std::string> class_types_string;
+  double max_obstacle_distance, min_obstacle_distance, observation_keep_time, transform_tolerance,
+    expected_update_rate, tile_map_decay_time;
+  bool track_unknown_space, visualize_tile_map;
+
+  nav2::declare_parameter_if_not_declared(node, name_ + "." + "enabled", rclcpp::ParameterValue(true));
+  nav2::declare_parameter_if_not_declared(node, name_ + "." + "combination_method", rclcpp::ParameterValue(1));
+  nav2::declare_parameter_if_not_declared(node, name_ + "." + "observation_sources", rclcpp::ParameterValue(std::string("")));
+  nav2::declare_parameter_if_not_declared(node, name_ + "." + "publish_debug_topics", rclcpp::ParameterValue(false));
+  nav2::declare_parameter_if_not_declared(node, name_ + "." + "use_approximate_time_sync", rclcpp::ParameterValue(true));
+
+  node->get_parameter(name_ + "." + "enabled", enabled_);
+  node->get_parameter(name_ + "." + "combination_method", combination_method_);
+  node->get_parameter(name_ + "." + "use_approximate_time_sync", use_approximate_time_sync_);
+  node->get_parameter("track_unknown_space", track_unknown_space);
+  node->get_parameter("transform_tolerance", transform_tolerance);  
+
+  global_frame_ = layered_costmap_->getGlobalFrameID();
+  rolling_window_ = layered_costmap_->isRolling();
+
+  if (track_unknown_space) {
+    default_value_ = NO_INFORMATION;
+  } else {
+    default_value_ = nav2_costmap_2d::FREE_SPACE;
+  }
+
+  matchSize();
+
+  node->get_parameter(name_ + "." + "observation_sources", topics_string_);
+
+  // now we need to split the topics based on whitespace which we can use a stringstream for
+  std::stringstream ss(topics_string_);
+
+  std::string source;
+
+  while (ss >> source) {
+    nav2::declare_parameter_if_not_declared(node, name_ + "." + source + "." + "segmentation_topic", rclcpp::ParameterValue(""));
+    nav2::declare_parameter_if_not_declared(node, name_ + "." + source + "." + "confidence_topic", rclcpp::ParameterValue(""));
+    nav2::declare_parameter_if_not_declared(node, name_ + "." + source + "." + "labels_topic", rclcpp::ParameterValue(""));
+    nav2::declare_parameter_if_not_declared(node, name_ + "." + source + "." + "pointcloud_topic", rclcpp::ParameterValue(""));
+    nav2::declare_parameter_if_not_declared(node, name_ + "." + source + "." + "observation_persistence", rclcpp::ParameterValue(0.0));
+    nav2::declare_parameter_if_not_declared(node, name_ + "." + source + "." + "expected_update_rate", rclcpp::ParameterValue(0.0));
+    nav2::declare_parameter_if_not_declared(node, name_ + "." + source + "." + "class_types", rclcpp::ParameterValue(std::vector<std::string>({})));
+    nav2::declare_parameter_if_not_declared(node, name_ + "." + source + "." + "max_obstacle_distance", rclcpp::ParameterValue(5.0));
+    nav2::declare_parameter_if_not_declared(node, name_ + "." + source + "." + "min_obstacle_distance", rclcpp::ParameterValue(0.3));
+    nav2::declare_parameter_if_not_declared(node, name_ + "." + source + "." + "tile_map_decay_time", rclcpp::ParameterValue(5.0));
+    nav2::declare_parameter_if_not_declared(node, name_ + "." + source + "." + "visualize_tile_map", rclcpp::ParameterValue(false));
+    nav2::declare_parameter_if_not_declared(node, name_ + "." + source + "." + "use_cost_selection", rclcpp::ParameterValue(true));
+    
+    node->get_parameter(name_ + "." + source + "." + "segmentation_topic", segmentation_topic);
+    node->get_parameter(name_ + "." + source + "." + "confidence_topic", confidence_topic);
+    node->get_parameter(name_ + "." + source + "." + "labels_topic", labels_topic);
+    node->get_parameter(name_ + "." + source + "." + "pointcloud_topic", pointcloud_topic);
+    node->get_parameter(name_ + "." + source + "." + "observation_persistence", observation_keep_time);
+    node->get_parameter(name_ + "." + source + "." + "expected_update_rate", expected_update_rate);
+    node->get_parameter(name_ + "." + source + "." + "class_types", class_types_string);
+    node->get_parameter(name_ + "." + source + "." + "max_obstacle_distance", max_obstacle_distance);
+    node->get_parameter(name_ + "." + source + "." + "min_obstacle_distance", min_obstacle_distance);
+    node->get_parameter(name_ + "." + source + "." + "tile_map_decay_time", tile_map_decay_time);
+    node->get_parameter(name_ + "." + source + "." + "visualize_tile_map", visualize_tile_map);
+    bool use_cost_selection = true;
+    node->get_parameter(name_ + "." + source + "." + "use_cost_selection", use_cost_selection);
+    if (class_types_string.empty())
     {
-        throw std::runtime_error{"Failed to lock node"};
+      RCLCPP_ERROR(logger_, "no class types defined for source %s. Segmentation plugin cannot work this way", source.c_str());
+      exit(-1);
     }
-    std::string segmentation_topic, confidence_topic, pointcloud_topic, labels_topic, sensor_frame;
-    std::vector<std::string> class_types_string;
-    double max_obstacle_distance, min_obstacle_distance, observation_keep_time, transform_tolerance,
-        expected_update_rate, tile_map_decay_time;
-    bool track_unknown_space, visualize_tile_map;
+    
+    std::unordered_map<std::string, CostHeuristicParams> class_map;
 
-    declareParameter("enabled", rclcpp::ParameterValue(true));
-    declareParameter("combination_method", rclcpp::ParameterValue(1));
-    declareParameter("observation_sources", rclcpp::ParameterValue(std::string("")));
-    declareParameter("publish_debug_topics", rclcpp::ParameterValue(false));
-    declareParameter("use_approximate_time_sync", rclcpp::ParameterValue(true));
-
-    node->get_parameter(name_ + "." + "enabled", enabled_);
-    node->get_parameter(name_ + "." + "combination_method", combination_method_);
-    node->get_parameter(name_ + "." + "use_approximate_time_sync", use_approximate_time_sync_);
-    node->get_parameter("track_unknown_space", track_unknown_space);
-    node->get_parameter("transform_tolerance", transform_tolerance);
-
-    global_frame_ = layered_costmap_->getGlobalFrameID();
-    rolling_window_ = layered_costmap_->isRolling();
-
-    if (track_unknown_space)
+    // Build class_type to class_names mapping for the buffer
+    std::unordered_map<std::string, std::vector<std::string>> class_type_to_names;
+    for (auto& class_type : class_types_string)
     {
-        default_value_ = NO_INFORMATION;
-    }
-    else
-    {
-        default_value_ = nav2_costmap_2d::FREE_SPACE;
-    }
-
-    matchSize();
-
-    node->get_parameter(name_ + "." + "observation_sources", topics_string_);
-
-    // now we need to split the topics based on whitespace which we can use a stringstream for
-    std::stringstream ss(topics_string_);
-
-    std::string source;
-
-    while (ss >> source)
-    {
-        declareParameter(source + "." + "segmentation_topic", rclcpp::ParameterValue(""));
-        declareParameter(source + "." + "confidence_topic", rclcpp::ParameterValue(""));
-        declareParameter(source + "." + "labels_topic", rclcpp::ParameterValue(""));
-        declareParameter(source + "." + "pointcloud_topic", rclcpp::ParameterValue(""));
-        declareParameter(source + "." + "observation_persistence", rclcpp::ParameterValue(0.0));
-        declareParameter(source + "." + "sensor_frame", rclcpp::ParameterValue(""));
-        declareParameter(source + "." + "expected_update_rate", rclcpp::ParameterValue(0.0));
-        declareParameter(source + "." + "class_types", rclcpp::ParameterValue(std::vector<std::string>({})));
-        declareParameter(source + "." + "max_obstacle_distance", rclcpp::ParameterValue(5.0));
-        declareParameter(source + "." + "min_obstacle_distance", rclcpp::ParameterValue(0.3));
-        declareParameter(source + "." + "tile_map_decay_time", rclcpp::ParameterValue(5.0));
-        declareParameter(source + "." + "visualize_tile_map", rclcpp::ParameterValue(false));
-        declareParameter(source + "." + "use_cost_selection", rclcpp::ParameterValue(true));
-        declareParameter(source + "." + "camera_horizontal_fov", rclcpp::ParameterValue(1.52));
-        declareParameter(source + "." + "camera_vertical_fov", rclcpp::ParameterValue(1.01));
-        declareParameter(source + "." + "fov_decay_time", rclcpp::ParameterValue(-1.0));
-        declareParameter(source + "." + "outside_fov_decay_time", rclcpp::ParameterValue(-1.0));
-        declareParameter(source + "." + "visualize_frustum_fov", rclcpp::ParameterValue(false));
-
-        node->get_parameter(name_ + "." + source + "." + "segmentation_topic", segmentation_topic);
-        node->get_parameter(name_ + "." + source + "." + "confidence_topic", confidence_topic);
-        node->get_parameter(name_ + "." + source + "." + "labels_topic", labels_topic);
-        node->get_parameter(name_ + "." + source + "." + "pointcloud_topic", pointcloud_topic);
-        node->get_parameter(name_ + "." + source + "." + "observation_persistence", observation_keep_time);
-        node->get_parameter(name_ + "." + source + "." + "sensor_frame", sensor_frame);
-        node->get_parameter(name_ + "." + source + "." + "expected_update_rate", expected_update_rate);
-        node->get_parameter(name_ + "." + source + "." + "class_types", class_types_string);
-        node->get_parameter(name_ + "." + source + "." + "max_obstacle_distance", max_obstacle_distance);
-        node->get_parameter(name_ + "." + source + "." + "min_obstacle_distance", min_obstacle_distance);
-        node->get_parameter(name_ + "." + source + "." + "tile_map_decay_time", tile_map_decay_time);
-        node->get_parameter(name_ + "." + source + "." + "visualize_tile_map", visualize_tile_map);
-        bool use_cost_selection = true;
-        node->get_parameter(name_ + "." + source + "." + "use_cost_selection", use_cost_selection);
-        double camera_h_fov, camera_v_fov, fov_decay_time, outside_fov_decay_time;
-        node->get_parameter(name_ + "." + source + "." + "camera_horizontal_fov", camera_h_fov);
-        node->get_parameter(name_ + "." + source + "." + "camera_vertical_fov", camera_v_fov);
-        node->get_parameter(name_ + "." + source + "." + "fov_decay_time", fov_decay_time);
-        node->get_parameter(name_ + "." + source + "." + "outside_fov_decay_time", outside_fov_decay_time);
-        bool visualize_frustum_fov = false;
-        node->get_parameter(name_ + "." + source + "." + "visualize_frustum_fov", visualize_frustum_fov);
-        if (class_types_string.empty())
-        {
-            RCLCPP_ERROR(logger_, "no class types defined for source %s. Segmentation plugin cannot work this way",
-                         source.c_str());
-            exit(-1);
-        }
-
-        std::unordered_map<std::string, CostHeuristicParams> class_map;
-
-          for (auto& class_type : class_types_string)
-          {
-            std::vector<std::string> classes_ids;
-            declareParameter(source + "." + class_type + ".classes", rclcpp::ParameterValue(std::vector<std::string>({})));
-            declareParameter(source + "." + class_type + ".base_cost", rclcpp::ParameterValue(0));
-            declareParameter(source + "." + class_type + ".max_cost", rclcpp::ParameterValue(0));
-            declareParameter(source + "." + class_type + ".mark_confidence", rclcpp::ParameterValue(0));
-            declareParameter(source + "." + class_type + ".samples_to_max_cost", rclcpp::ParameterValue(0));
-            declareParameter(source + "." + class_type + ".dominant_priority", rclcpp::ParameterValue(false));
-
-            node->get_parameter(name_ + "." + source + "." + class_type + ".classes", classes_ids);
-            if (classes_ids.empty())
-            {
-              RCLCPP_ERROR(logger_, "no classes defined on type %s", class_type.c_str());
-              continue;
-            }
-            CostHeuristicParams cost_params;
-            node->get_parameter(name_ + "." + source + "." + class_type + ".base_cost", cost_params.base_cost);
-            node->get_parameter(name_ + "." + source + "." + class_type + ".max_cost", cost_params.max_cost);
-            node->get_parameter(name_ + "." + source + "." + class_type + ".mark_confidence", cost_params.mark_confidence);
+      std::vector<std::string> classes_ids;
+      nav2::declare_parameter_if_not_declared(node, name_ + "." + source + "." + class_type + ".classes", rclcpp::ParameterValue(std::vector<std::string>({})));
+      nav2::declare_parameter_if_not_declared(node, name_ + "." + source + "." + class_type + ".base_cost", rclcpp::ParameterValue(0));
+      nav2::declare_parameter_if_not_declared(node, name_ + "." + source + "." + class_type + ".max_cost", rclcpp::ParameterValue(0));
+      nav2::declare_parameter_if_not_declared(node, name_ + "." + source + "." + class_type + ".mark_confidence", rclcpp::ParameterValue(0));
+      nav2::declare_parameter_if_not_declared(node, name_ + "." + source + "." + class_type + ".samples_to_max_cost", rclcpp::ParameterValue(0));
+      nav2::declare_parameter_if_not_declared(node, name_ + "." + source + "." + class_type + ".dominant_priority", rclcpp::ParameterValue(false));
+      
+      node->get_parameter(name_ + "." + source + "." + class_type + ".classes", classes_ids);
+      if (classes_ids.empty())
+      {
+        RCLCPP_ERROR(logger_, "no classes defined on type %s", class_type.c_str());
+        continue;
+      }
+      
+      // Store the mapping for the buffer
+      class_type_to_names[class_type] = classes_ids;
+      
+      CostHeuristicParams cost_params;
+      node->get_parameter(name_ + "." + source + "." + class_type + ".base_cost", cost_params.base_cost);
+      node->get_parameter(name_ + "." + source + "." + class_type + ".max_cost", cost_params.max_cost);
+      node->get_parameter(name_ + "." + source + "." + class_type + ".mark_confidence", cost_params.mark_confidence);
       node->get_parameter(name_ + "." + source + "." + class_type + ".samples_to_max_cost", cost_params.samples_to_max_cost);
-                   node->get_parameter(name_ + "." + source + "." + class_type + ".dominant_priority", cost_params.dominant_priority);
+      node->get_parameter(name_ + "." + source + "." + class_type + ".dominant_priority", cost_params.dominant_priority);
+      
+      for (auto& class_id : classes_ids)
+      {
+        class_map.insert(std::pair<std::string, CostHeuristicParams>(class_id, cost_params));
+      }
+    }
 
-            for (auto& class_id : classes_ids)
-            {
-              class_map.insert(std::pair<std::string, CostHeuristicParams>(class_id, cost_params));
-            }
-          }
+    if (class_map.empty())
+    {
+      RCLCPP_ERROR(logger_, "No classes defined for source %s. Segmentation plugin cannot work this way", source.c_str());
+      exit(-1);
+    }
 
-        if (class_map.empty())
-        {
-                RCLCPP_ERROR(logger_, "No classes defined for source %s. Segmentation plugin cannot work this way", source.c_str());
-            exit(-1);
-        }
+    //sensor data subscriptions
+    auto sub_opt = rclcpp::SubscriptionOptions();
+    sub_opt.callback_group = callback_group_;
+    const auto custom_qos_profile = nav2::qos::SensorDataQoS(50);
 
-        //sensor data subscriptions
-        auto sub_opt = rclcpp::SubscriptionOptions();
-        sub_opt.callback_group = callback_group_;
-        rmw_qos_profile_t custom_qos_profile = rmw_qos_profile_sensor_data;
+    // label info subscription
+    rclcpp::SubscriptionOptionsWithAllocator<std::allocator<void>> tl_sub_opt;
+    tl_sub_opt.use_intra_process_comm = rclcpp::IntraProcessSetting::Disable;
+    tl_sub_opt.callback_group = callback_group_;
+    rclcpp::QoS tl_qos_profile = nav2::qos::LatchedSubscriptionQoS(5);
 
-        // label info subscription
-        rclcpp::SubscriptionOptionsWithAllocator<std::allocator<void>> tl_sub_opt;
-        tl_sub_opt.use_intra_process_comm = rclcpp::IntraProcessSetting::Disable;
-        tl_sub_opt.callback_group = callback_group_;
-        rmw_qos_profile_t tl_qos = rmw_qos_profile_system_default;
-        tl_qos.history = RMW_QOS_POLICY_HISTORY_KEEP_ALL;
-        tl_qos.depth = 5;
-        tl_qos.reliability = RMW_QOS_POLICY_RELIABILITY_RELIABLE;
-        tl_qos.durability = RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL;
+    auto segmentation_buffer = std::make_shared<semantic_segmentation_layer::SegmentationBuffer>(
+      node, source, class_types_string, class_map, class_type_to_names, observation_keep_time, expected_update_rate, max_obstacle_distance,
+      min_obstacle_distance, *tf_, global_frame_, "",
+      tf2::durationFromSec(transform_tolerance), getResolution(), tile_map_decay_time, visualize_tile_map,
+      use_cost_selection);
 
-        auto segmentation_buffer = std::make_shared<semantic_segmentation_layer::SegmentationBuffer>(
-          node, source, class_types_string, class_map, observation_keep_time, expected_update_rate, max_obstacle_distance,
-          min_obstacle_distance, *tf_, global_frame_, sensor_frame,
-          tf2::durationFromSec(transform_tolerance), getResolution(), tile_map_decay_time, visualize_tile_map, use_cost_selection,
-          camera_h_fov, camera_v_fov,
-          fov_decay_time, outside_fov_decay_time, visualize_frustum_fov);
+    segmentation_buffers_.push_back(segmentation_buffer);
 
-        segmentation_buffers_.push_back(segmentation_buffer);
+    // Kilted+ takes rclcpp::QoS directly; pre-Kilted needs rmw_qos_profile_t and a
+    // LifecycleNode shared_ptr. SubFilter and SUB_QOS hide the version split.
+#if RCLCPP_VERSION_GTE(29, 6, 0)
+    auto& sub_node = node;
+#define SUB_QOS(q) (q)
+#else
+    auto sub_node = std::static_pointer_cast<rclcpp_lifecycle::LifecycleNode>(node);
+#define SUB_QOS(q) ((q).get_rmw_qos_profile())
+#endif
 
+    auto semantic_segmentation_sub = std::make_shared<SubFilter<sensor_msgs::msg::Image>>(
+        sub_node, segmentation_topic, SUB_QOS(custom_qos_profile), sub_opt);
+    semantic_segmentation_sub->unsubscribe();
+    semantic_segmentation_subs_.push_back(semantic_segmentation_sub);
 
-        auto semantic_segmentation_sub =
-            std::make_shared<message_filters::Subscriber<sensor_msgs::msg::Image, rclcpp_lifecycle::LifecycleNode>>(
-                node, segmentation_topic, custom_qos_profile, sub_opt);
-        semantic_segmentation_subs_.push_back(semantic_segmentation_sub);
-
-          auto label_info_sub = std::make_shared<message_filters::Subscriber<vision_msgs::msg::LabelInfo, rclcpp_lifecycle::LifecycleNode>>(
-            node, labels_topic, tl_qos, tl_sub_opt);
-        label_info_sub->registerCallback(std::bind(&SemanticSegmentationLayer::labelinfoCb, this, std::placeholders::_1, segmentation_buffers_.back()));
+    auto label_info_sub = std::make_shared<SubFilter<vision_msgs::msg::LabelInfo>>(
+        sub_node, labels_topic, SUB_QOS(tl_qos_profile), tl_sub_opt);
+    label_info_sub->registerCallback(std::bind(&SemanticSegmentationLayer::labelinfoCb, this, std::placeholders::_1, segmentation_buffers_.back()));
+    label_info_sub->unsubscribe();
     label_info_subs_.push_back(label_info_sub);
 
-    auto pointcloud_sub = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::PointCloud2, rclcpp_lifecycle::LifecycleNode>>(
-      node, pointcloud_topic, custom_qos_profile, sub_opt);
+    auto pointcloud_sub = std::make_shared<SubFilter<sensor_msgs::msg::PointCloud2>>(
+      sub_node, pointcloud_topic, SUB_QOS(custom_qos_profile), sub_opt);
+    pointcloud_sub->unsubscribe();
     pointcloud_subs_.push_back(pointcloud_sub);
 
     auto pointcloud_tf_sub = std::make_shared<tf2_ros::MessageFilter<sensor_msgs::msg::PointCloud2>>(
-      *pointcloud_subs_.back(), *tf_, global_frame_, 1000, node->get_node_logging_interface(),
-          node->get_node_clock_interface(),
-          tf2::durationFromSec(transform_tolerance));
+      *pointcloud_subs_.back(), *tf_, global_frame_, 50,
+      node->get_node_logging_interface(),
+      node->get_node_clock_interface(),
+      tf2::durationFromSec(transform_tolerance));
     pointcloud_tf_subs_.push_back(pointcloud_tf_sub);
 
     if(!confidence_topic.empty())
     {
-      auto semantic_segmentation_confidence_sub =
-      std::make_shared<message_filters::Subscriber<sensor_msgs::msg::Image, rclcpp_lifecycle::LifecycleNode>>(
-        node, confidence_topic, custom_qos_profile, sub_opt);
+      auto semantic_segmentation_confidence_sub = std::make_shared<SubFilter<sensor_msgs::msg::Image>>(
+          sub_node, confidence_topic, SUB_QOS(custom_qos_profile), sub_opt);
+      semantic_segmentation_confidence_sub->unsubscribe();
       semantic_segmentation_confidence_subs_.push_back(semantic_segmentation_confidence_sub);
-
-            if (use_approximate_time_sync_)
-            {
-                // Use ApproximateTime policy with 0.1 second slop
-                auto segm_conf_pc_approx_sync = std::make_shared<ApproxSync3>(
-                    ApproxSyncPolicy3(1000),
-                    *semantic_segmentation_subs_.back(), *semantic_segmentation_confidence_subs_.back(),
-                    *pointcloud_tf_subs_.back());
-                segm_conf_pc_approx_sync->setMaxIntervalDuration(rclcpp::Duration(0, 100000000));  // 0.1 seconds
-                segm_conf_pc_approx_sync->registerCallback(std::bind(&SemanticSegmentationLayer::syncSegmConfPointcloudCb, this,
-                                                              std::placeholders::_1, std::placeholders::_2,
-                                                              std::placeholders::_3, segmentation_buffers_.back()));
-                segm_conf_pc_notifiers_.push_back(segm_conf_pc_approx_sync);
-                RCLCPP_INFO(logger_, "Confidence is enabled for source %s (using ApproximateTime sync)", source.c_str());
-            }
-            else
-            {
-                // Use exact time synchronization
-                auto segm_conf_pc_sync = std::make_shared<ExactSync3>(
-                    *semantic_segmentation_subs_.back(), *semantic_segmentation_confidence_subs_.back(),
-                    *pointcloud_tf_subs_.back(), 1000);
-                segm_conf_pc_sync->registerCallback(std::bind(&SemanticSegmentationLayer::syncSegmConfPointcloudCb, this,
-                                                          std::placeholders::_1, std::placeholders::_2,
-                                                          std::placeholders::_3, segmentation_buffers_.back()));
-                segm_conf_pc_notifiers_.push_back(segm_conf_pc_sync);
-                RCLCPP_INFO(logger_, "Confidence is enabled for source %s (using ExactTime sync)", source.c_str());
-              }
-        }
-        else
-        {
-          RCLCPP_WARN(logger_, "Confidence topic was empty for source %s, not using segmentation confidence in that source", source.c_str());
-
-          if (use_approximate_time_sync_)
-          {
-            // Use ApproximateTime policy with 0.1 second slop
-            auto segm_pc_approx_sync = std::make_shared<ApproxSync2>(
-                ApproxSyncPolicy2(1000),
-                *semantic_segmentation_subs_.back(), *pointcloud_tf_subs_.back());
-            segm_pc_approx_sync->setMaxIntervalDuration(rclcpp::Duration(0, 100000000));  // 0.1 seconds
-            segm_pc_approx_sync->registerCallback(std::bind(&SemanticSegmentationLayer::syncSegmPointcloudCb, this,
-                                                    std::placeholders::_1, std::placeholders::_2,
-                                                    segmentation_buffers_.back()));
-            segm_pc_notifiers_.push_back(segm_pc_approx_sync);
-          }
-          else
-          {
-            // Use exact time synchronization
-            auto segm_pc_sync = std::make_shared<ExactSync2>(
-                *semantic_segmentation_subs_.back(), *pointcloud_tf_subs_.back(), 1000);
-            segm_pc_sync->registerCallback(std::bind(&SemanticSegmentationLayer::syncSegmPointcloudCb, this,
-                                                      std::placeholders::_1, std::placeholders::_2,
-                                                      segmentation_buffers_.back()));
-            segm_pc_notifiers_.push_back(segm_pc_sync);
-          }
-        }
+      if (use_approximate_time_sync_)
+      {
+        auto segm_conf_pc_approx_sync = std::make_shared<ApproxSync3>(
+          ApproxSyncPolicy3(1000),
+          *semantic_segmentation_subs_.back(), *semantic_segmentation_confidence_subs_.back(),
+          *pointcloud_tf_subs_.back());
+        segm_conf_pc_approx_sync->setMaxIntervalDuration(rclcpp::Duration(0, 100000000));
+        segm_conf_pc_approx_sync->registerCallback(std::bind(
+          &SemanticSegmentationLayer::syncSegmConfPointcloudCb, this,
+          std::placeholders::_1, std::placeholders::_2,
+          std::placeholders::_3, segmentation_buffers_.back()));
+        segm_conf_pc_notifiers_.push_back(segm_conf_pc_approx_sync);
+        RCLCPP_INFO(
+          logger_, "Confidence is enabled for source %s (using ApproximateTime sync)",
+          source.c_str());
       }
+      else
+      {
+#if RCLCPP_VERSION_GTE(29, 6, 0)
+        // Kilted+ message_filters::TimeSynchronizer takes queue_size first.
+        auto segm_conf_pc_sync = std::make_shared<ExactSync3>(
+          1000,
+          *semantic_segmentation_subs_.back(), *semantic_segmentation_confidence_subs_.back(),
+          *pointcloud_tf_subs_.back());
+#else
+        auto segm_conf_pc_sync = std::make_shared<ExactSync3>(
+          *semantic_segmentation_subs_.back(), *semantic_segmentation_confidence_subs_.back(),
+          *pointcloud_tf_subs_.back(), 1000);
+#endif
+        segm_conf_pc_sync->registerCallback(std::bind(
+          &SemanticSegmentationLayer::syncSegmConfPointcloudCb, this,
+          std::placeholders::_1, std::placeholders::_2,
+          std::placeholders::_3, segmentation_buffers_.back()));
+        segm_conf_pc_notifiers_.push_back(segm_conf_pc_sync);
+        RCLCPP_INFO(
+          logger_, "Confidence is enabled for source %s (using ExactTime sync)",
+          source.c_str());
+      }
+    }
+    else
+    {
+      RCLCPP_WARN(logger_, "Confidence topic was empty for source %s, not using segmentation confidence in that source", source.c_str());
+      if (use_approximate_time_sync_)
+      {
+        auto segm_pc_approx_sync = std::make_shared<ApproxSync2>(
+          ApproxSyncPolicy2(1000),
+          *semantic_segmentation_subs_.back(), *pointcloud_tf_subs_.back());
+        segm_pc_approx_sync->setMaxIntervalDuration(rclcpp::Duration(0, 100000000));
+        segm_pc_approx_sync->registerCallback(std::bind(
+          &SemanticSegmentationLayer::syncSegmPointcloudCb, this,
+          std::placeholders::_1, std::placeholders::_2, segmentation_buffers_.back()));
+        segm_pc_notifiers_.push_back(segm_pc_approx_sync);
+      }
+      else
+      {
+#if RCLCPP_VERSION_GTE(29, 6, 0)
+        auto segm_pc_sync = std::make_shared<ExactSync2>(
+          1000,
+          *semantic_segmentation_subs_.back(), *pointcloud_tf_subs_.back());
+#else
+        auto segm_pc_sync = std::make_shared<ExactSync2>(
+          *semantic_segmentation_subs_.back(), *pointcloud_tf_subs_.back(), 1000);
+#endif
+        segm_pc_sync->registerCallback(std::bind(
+          &SemanticSegmentationLayer::syncSegmPointcloudCb, this,
+          std::placeholders::_1, std::placeholders::_2, segmentation_buffers_.back()));
+        segm_pc_notifiers_.push_back(segm_pc_sync);
+      }
+    }
+  }
 
   dyn_params_handler_ = node->add_on_set_parameters_callback(
     std::bind(
@@ -328,7 +339,7 @@ void SemanticSegmentationLayer::updateBounds(double robot_x, double robot_y, dou
     return;
   }
   double current_time = node->now().seconds();
-
+  
   // Check if the current time is valid
   if (current_time <= 0.0) {
     RCLCPP_WARN(logger_, "Invalid current time in updateBounds: %.3f", current_time);
@@ -340,19 +351,19 @@ void SemanticSegmentationLayer::updateBounds(double robot_x, double robot_y, dou
   {
     auto buffer = tile_map_pair.second;
     buffer->lock();
-
+    
     // Purge old observations in updateBounds before computing costs to ensure the costmap accurately reflects the current state after decay, maintaining consistency between the buffer and the costmap.
     tile_map_pair.first->purgeOldObservations(current_time);
-
+        
     for(auto& tile: *tile_map_pair.first)
     {
       // Check if the tile has valid observations after purge
       if (tile.second.empty()) {
         continue;
       }
-
+      
       TileWorldXY tile_world_coords = tile_map_pair.first->indexToWorld(tile.first.x, tile.first.y);
-      TemporalObservationQueue& obs_queue = tile.second;
+      TemporalObservationQueue& obs_queue = tile.second;      
       unsigned int mx, my;
       if (!worldToMap(tile_world_coords.x, tile_world_coords.y, mx, my))
       {
@@ -361,7 +372,7 @@ void SemanticSegmentationLayer::updateBounds(double robot_x, double robot_y, dou
       }
       unsigned int index = getIndex(mx, my);
       CostHeuristicParams cost_params = buffer->getCostForClassId(obs_queue.getClassId());
-      if(static_cast<int>(obs_queue.size()) >= cost_params.samples_to_max_cost &&
+      if(static_cast<int>(obs_queue.size()) >= cost_params.samples_to_max_cost && 
          obs_queue.getConfidenceSum() / obs_queue.size() > cost_params.mark_confidence)
       {
         costmap_[index] = cost_params.max_cost;
@@ -391,8 +402,8 @@ void SemanticSegmentationLayer::onFootprintChanged()
 // It updates the costmap within its window bounds.
 // Inside this method the costmap gradient is generated and is writing directly
 // to the resulting costmap master_grid without any merging with previous layers.
-void SemanticSegmentationLayer::updateCosts(nav2_costmap_2d::Costmap2D& master_grid, int min_i, int min_j, int max_i,
-                                            int max_j)
+void SemanticSegmentationLayer::updateCosts(nav2_costmap_2d::Costmap2D& master_grid, int min_i,
+                                            int min_j, int max_i, int max_j)
 {
   std::lock_guard<Costmap2D::mutex_t> guard(*getMutex());
   if (!enabled_)
@@ -425,7 +436,7 @@ void SemanticSegmentationLayer::updateCosts(nav2_costmap_2d::Costmap2D& master_g
 
 void SemanticSegmentationLayer::labelinfoCb(
     const std::shared_ptr<const vision_msgs::msg::LabelInfo>& label_info,
-    const std::shared_ptr<semantic_segmentation_layer::SegmentationBuffer>& buffer)
+    const std::shared_ptr<semantic_segmentation_layer::SegmentationBuffer> & buffer)
     {
       buffer->createSegmentationCostMultimap(*label_info);
     }
@@ -433,7 +444,7 @@ void SemanticSegmentationLayer::labelinfoCb(
 void SemanticSegmentationLayer::syncSegmPointcloudCb(
   const std::shared_ptr<const sensor_msgs::msg::Image>& segmentation,
   const std::shared_ptr<const sensor_msgs::msg::PointCloud2>& pointcloud,
-    const std::shared_ptr<semantic_segmentation_layer::SegmentationBuffer>& buffer)
+  const std::shared_ptr<semantic_segmentation_layer::SegmentationBuffer> & buffer)
 {
   if (segmentation->width * segmentation->height != pointcloud->width * pointcloud->height)
   {
@@ -455,10 +466,7 @@ void SemanticSegmentationLayer::syncSegmPointcloudCb(
   }
   if (buffer->isClassIdCostMapEmpty())
   {
-        RCLCPP_WARN(logger_,
-                    "Class map is empty because a labelinfo message has not been received for topic %s. Will not "
-                    "buffer message",
-                    buffer->getBufferSource().c_str());
+    RCLCPP_WARN(logger_, "Class map is empty because a labelinfo message has not been received for topic %s. Will not buffer message", buffer->getBufferSource().c_str());
     return;
   }
   // if no confidence available, create a mask with all elements having max confidence
@@ -471,8 +479,7 @@ void SemanticSegmentationLayer::syncSegmPointcloudCb(
   buffer->unlock();
 }
 
-void SemanticSegmentationLayer::syncSegmConfPointcloudCb(
-    const std::shared_ptr<const sensor_msgs::msg::Image>& segmentation,
+void SemanticSegmentationLayer::syncSegmConfPointcloudCb(const std::shared_ptr<const sensor_msgs::msg::Image>& segmentation,
                               const std::shared_ptr<const sensor_msgs::msg::Image>& confidence,
                               const std::shared_ptr<const sensor_msgs::msg::PointCloud2>& pointcloud,
                               const std::shared_ptr<semantic_segmentation_layer::SegmentationBuffer>& buffer)
@@ -497,10 +504,7 @@ void SemanticSegmentationLayer::syncSegmConfPointcloudCb(
     }
     if (buffer->isClassIdCostMapEmpty())
     {
-        RCLCPP_WARN(logger_,
-                    "Class map is empty because a labelinfo message has not been received for topic %s. Will not "
-                    "buffer message",
-                    buffer->getBufferSource().c_str());
+      RCLCPP_WARN(logger_, "Class map is empty because a labelinfo message has not been received for topic %s. Will not buffer message", buffer->getBufferSource().c_str());
       return;
     }
     buffer->lock();
@@ -520,8 +524,7 @@ bool SemanticSegmentationLayer::getSegmentationTileMaps(
 {
   bool current = true;
   // get the marking observations
-    for (unsigned int i = 0; i < segmentation_buffers_.size(); ++i)
-    {
+  for (unsigned int i = 0; i < segmentation_buffers_.size(); ++i) {
     segmentation_buffers_[i]->lock();
     SegmentationTileMap::SharedPtr tile_map = segmentation_buffers_[i]->getSegmentationTileMap();
     segmentation_tile_maps.emplace_back(std::make_pair(tile_map, segmentation_buffers_[i]));
@@ -530,109 +533,77 @@ bool SemanticSegmentationLayer::getSegmentationTileMaps(
   return current;
 }
 
-rcl_interfaces::msg::SetParametersResult SemanticSegmentationLayer::dynamicParametersCallback(
+  rcl_interfaces::msg::SetParametersResult
+SemanticSegmentationLayer::dynamicParametersCallback(
   std::vector<rclcpp::Parameter> parameters)
 {
   std::lock_guard<Costmap2D::mutex_t> guard(*getMutex());
   auto result = rcl_interfaces::msg::SetParametersResult();
-    for (auto parameter : parameters)
-    {
-        const auto& type = parameter.get_type();
-        const auto& name = parameter.get_name();
+  for (auto parameter : parameters) {
+    const auto & type = parameter.get_type();
+    const auto & name = parameter.get_name();
 
-        if (type == rclcpp::ParameterType::PARAMETER_BOOL)
-        {
-            if (name == name_ + "." + "enabled")
-            {
+    if (type == rclcpp::ParameterType::PARAMETER_BOOL) {
+      if (name == name_ + "." + "enabled") {
         enabled_ = parameter.as_bool();
       }
     }
 
     std::stringstream ss(topics_string_);
     std::string source;
-        while (ss >> source)
-        {
-            if (type == rclcpp::ParameterType::PARAMETER_DOUBLE)
-            {
-                if (name == name_ + "." + source + "." + "max_obstacle_distance")
-                {
-                    for (auto& buffer : segmentation_buffers_)
-                    {
-                        if (buffer->getBufferSource() == source)
-                        {
+    while (ss >> source) {
+      if (type == rclcpp::ParameterType::PARAMETER_DOUBLE) {
+        if (name == name_ + "." + source + "." + "max_obstacle_distance") {
+          for (auto & buffer : segmentation_buffers_) {
+            if (buffer->getBufferSource() == source) {
               buffer->setMaxObstacleDistance(parameter.as_double());
             }
           }
-                }
-                else if (name == name_ + "." + source + "." + "min_obstacle_distance")
-                {
-                    for (auto& buffer : segmentation_buffers_)
-                    {
-                        if (buffer->getBufferSource() == source)
-                        {
+        } else if (name == name_ + "." + source + "." + "min_obstacle_distance") {
+          for (auto & buffer : segmentation_buffers_) {
+            if (buffer->getBufferSource() == source) {
               buffer->setMinObstacleDistance(parameter.as_double());
             }
           }
         }
-      }
-      else if (type == rclcpp::ParameterType::PARAMETER_INTEGER) 
-      {
-        for (auto& buffer : segmentation_buffers_)
-        {
-          if (buffer->getBufferSource() == source) 
-          {
-            for (auto& class_type : buffer->getClassTypes())
-            {
+      } else if (type == rclcpp::ParameterType::PARAMETER_INTEGER) {
+        for(auto & buffer : segmentation_buffers_) {
+          if (buffer->getBufferSource() == source) {
+            for(auto & class_type : buffer->getClassTypes()){
+              // Get class names from buffer instead of reading parameter
+              auto class_names_for_type = buffer->getClassNamesForType(class_type);
+              
               if (name == name_ + "." + source +  "." + class_type + "." + "base_cost") {
-                CostHeuristicParams cost_params;
-                std::vector<std::string> class_names_for_type;
-                node_.lock()->get_parameter(name_ + "." + source + "." + class_type + ".classes", class_names_for_type);
                 for(auto & class_name : class_names_for_type){
-                  cost_params = buffer->getCostForClassName(class_name);
+                  CostHeuristicParams cost_params = buffer->getCostForClassName(class_name);
                   cost_params.base_cost = parameter.as_int();
                   buffer->updateClassMap(class_name, cost_params);
                 }
               }
-              if (name == name_ + "." + source + "." + class_type + "." + "max_cost") 
-              {
-                CostHeuristicParams cost_params;
-                std::vector<std::string> class_names_for_type;
-                node_.lock()->get_parameter(name_ + "." + source + "." + class_type + ".classes", class_names_for_type);
+              if (name == name_ + "." + source +  "." + class_type + "." + "max_cost") {
                 for(auto & class_name : class_names_for_type){
-                  cost_params = buffer->getCostForClassName(class_name);
+                  CostHeuristicParams cost_params = buffer->getCostForClassName(class_name);
                   cost_params.max_cost = parameter.as_int();
                   buffer->updateClassMap(class_name, cost_params);
                 }
               }
-              if (name == name_ + "." + source + "." + class_type + "." + "mark_confidence") 
-              {
-                CostHeuristicParams cost_params;
-                std::vector<std::string> class_names_for_type;
-                node_.lock()->get_parameter(name_ + "." + source + "." + class_type + ".classes", class_names_for_type);
+              if (name == name_ + "." + source +  "." + class_type + "." + "mark_confidence") {
                 for(auto & class_name : class_names_for_type){
-                  cost_params = buffer->getCostForClassName(class_name);
+                  CostHeuristicParams cost_params = buffer->getCostForClassName(class_name);
                   cost_params.mark_confidence = parameter.as_int();
                   buffer->updateClassMap(class_name, cost_params);
                 }
               }
-              if (name == name_ + "." + source + "." + class_type + "." + "samples_to_max_cost") 
-              {
-                CostHeuristicParams cost_params;
-                std::vector<std::string> class_names_for_type;
-                node_.lock()->get_parameter(name_ + "." + source + "." + class_type + ".classes", class_names_for_type);
+              if (name == name_ + "." + source +  "." + class_type + "." + "samples_to_max_cost") {
                 for(auto & class_name : class_names_for_type){
-                  cost_params = buffer->getCostForClassName(class_name);
+                  CostHeuristicParams cost_params = buffer->getCostForClassName(class_name);
                   cost_params.samples_to_max_cost = parameter.as_int();
                   buffer->updateClassMap(class_name, cost_params);
                 }
               }
-              if (name == name_ + "." + source + "." + class_type + ".dominant_priority")
-              {
-                CostHeuristicParams cost_params;
-                std::vector<std::string> class_names_for_type;
-                node_.lock()->get_parameter(name_ + "." + source + "." + class_type + ".classes", class_names_for_type);
+              if (name == name_ + "." + source +  "." + class_type + ".dominant_priority") {
                 for(auto & class_name : class_names_for_type){
-                  cost_params = buffer->getCostForClassName(class_name);
+                  CostHeuristicParams cost_params = buffer->getCostForClassName(class_name);
                   cost_params.dominant_priority = parameter.as_bool();
                   buffer->updateClassMap(class_name, cost_params);
                 }
@@ -646,6 +617,56 @@ rcl_interfaces::msg::SetParametersResult SemanticSegmentationLayer::dynamicParam
 
   result.successful = true;
   return result;
+}
+
+void SemanticSegmentationLayer::activate()
+{
+  // Subscribe to all topics
+  for (unsigned int i = 0; i < semantic_segmentation_subs_.size(); ++i) {
+    if (semantic_segmentation_subs_[i] != NULL) {
+      semantic_segmentation_subs_[i]->subscribe();
+    }
+  }
+  for (unsigned int i = 0; i < semantic_segmentation_confidence_subs_.size(); ++i) {
+    if (semantic_segmentation_confidence_subs_[i] != NULL) {
+      semantic_segmentation_confidence_subs_[i]->subscribe();
+    }
+  }
+  for (unsigned int i = 0; i < label_info_subs_.size(); ++i) {
+    if (label_info_subs_[i] != NULL) {
+      label_info_subs_[i]->subscribe();
+    }
+  }
+  for (unsigned int i = 0; i < pointcloud_subs_.size(); ++i) {
+    if (pointcloud_subs_[i] != NULL) {
+      pointcloud_subs_[i]->subscribe();
+    }
+  }
+}
+
+void SemanticSegmentationLayer::deactivate()
+{
+  // Unsubscribe from all topics
+  for (unsigned int i = 0; i < semantic_segmentation_subs_.size(); ++i) {
+    if (semantic_segmentation_subs_[i] != NULL) {
+      semantic_segmentation_subs_[i]->unsubscribe();
+    }
+  }
+  for (unsigned int i = 0; i < semantic_segmentation_confidence_subs_.size(); ++i) {
+    if (semantic_segmentation_confidence_subs_[i] != NULL) {
+      semantic_segmentation_confidence_subs_[i]->unsubscribe();
+    }
+  }
+  for (unsigned int i = 0; i < label_info_subs_.size(); ++i) {
+    if (label_info_subs_[i] != NULL) {
+      label_info_subs_[i]->unsubscribe();
+    }
+  }
+  for (unsigned int i = 0; i < pointcloud_subs_.size(); ++i) {
+    if (pointcloud_subs_[i] != NULL) {
+      pointcloud_subs_[i]->unsubscribe();
+    }
+  }
 }
 
 }  // namespace semantic_segmentation_layer

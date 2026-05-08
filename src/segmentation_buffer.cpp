@@ -52,7 +52,7 @@
 using namespace std::chrono_literals;
 
 namespace semantic_segmentation_layer {
-SegmentationBuffer::SegmentationBuffer(const nav2_util::LifecycleNode::WeakPtr& parent,
+SegmentationBuffer::SegmentationBuffer(const nav2::LifecycleNode::WeakPtr& parent,
                                        std::string buffer_source, std::vector<std::string> class_types, std::unordered_map<std::string, CostHeuristicParams> class_names_cost_map, double observation_keep_time,
                                        double expected_update_rate, double max_lookahead_distance,
                                        double min_lookahead_distance, tf2_ros::Buffer& tf2_buffer,
@@ -101,19 +101,19 @@ SegmentationBuffer::~SegmentationBuffer() {}
 
 void SegmentationBuffer::createSegmentationCostMultimap(const vision_msgs::msg::LabelInfo& label_info)
 {
-    std::unordered_map<std::string, uint8_t> class_to_id_map;
-    for (const auto& semantic_class : label_info.class_map)
-    {
-        const auto& name = semantic_class.class_name;
-        if (class_names_cost_map_.find(name) == class_names_cost_map_.end()) {
-          // RCLCPP_INFO(logger_,
-          //   "CRITICAL ERROR: Class '%s' from label_info is not defined in the costmap parameters! This class will be ignored.",
-          //   name.c_str());
-          continue;
-        }
-        class_to_id_map[name] = semantic_class.class_id;
+  std::unordered_map<std::string, uint8_t> class_to_id_map;
+  for (const auto& semantic_class : label_info.class_map)
+  {
+    const auto& name = semantic_class.class_name;
+    if (class_names_cost_map_.find(name) == class_names_cost_map_.end()) {
+      RCLCPP_INFO(logger_,
+        "CRITICAL ERROR: Class '%s' from label_info is not defined in the costmap parameters! This class will be ignored.",
+        name.c_str());
+      continue;
     }
-    segmentation_cost_multimap_ = std::make_shared<SegmentationCostMultimap>(class_to_id_map, class_names_cost_map_);
+    class_to_id_map[name] = semantic_class.class_id;
+  }
+  segmentation_cost_multimap_ = std::make_shared<SegmentationCostMultimap>(class_to_id_map, class_names_cost_map_);
 }
 
 void SegmentationBuffer::bufferSegmentation(const sensor_msgs::msg::PointCloud2& cloud,
