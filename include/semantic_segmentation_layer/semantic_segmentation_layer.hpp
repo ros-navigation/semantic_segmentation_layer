@@ -119,6 +119,16 @@ class SemanticSegmentationLayer : public nav2_costmap_2d::CostmapLayer
     virtual bool isClearable() { return true; }
 
     /**
+     * @brief Activate this layer - subscribe to topics
+     */
+    virtual void activate();
+
+    /**
+     * @brief Deactivate this layer - unsubscribe from topics
+     */
+    virtual void deactivate();
+
+    /**
      * @brief Get the buffers and the tile maps the plugin stores. one for each source. Takes a vector of tile maps
      * as reference and fills it inside the function
      * @param segmentation_tile_maps the vector of tile maps to be filled by the function
