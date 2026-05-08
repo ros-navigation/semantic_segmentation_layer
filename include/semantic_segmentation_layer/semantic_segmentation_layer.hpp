@@ -47,7 +47,6 @@
 #include "message_filters/subscriber.hpp"
 #include "message_filters/synchronizer.hpp"
 #include "message_filters/sync_policies/approximate_time.hpp"
-#include "message_filters/time_synchronizer.hpp"
 #include "nav2_costmap_2d/costmap_layer.hpp"
 #include "nav2_costmap_2d/layer.hpp"
 #include "nav2_costmap_2d/layered_costmap.hpp"
@@ -115,16 +114,6 @@ class SemanticSegmentationLayer : public nav2_costmap_2d::CostmapLayer
      * @brief If clearing operations should be processed on this layer or not
      */
     virtual bool isClearable() { return true; }
-
-    /**
-     * @brief Activate this layer - subscribe to topics
-     */
-    virtual void activate();
-
-    /**
-     * @brief Deactivate this layer - unsubscribe from topics
-     */
-    virtual void deactivate();
 
     /**
      * @brief Get the buffers and the tile maps the plugin stores. one for each source. Takes a vector of tile maps

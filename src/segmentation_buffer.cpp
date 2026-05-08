@@ -39,66 +39,62 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cmath>
 #include <list>
 #include <string>
 #include <vector>
+#include <cmath>
 
-#include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/point_cloud2_iterator.hpp"
 #include "tf2/convert.h"
+#include "rclcpp/rclcpp.hpp"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 #include "visualization_msgs/msg/marker.hpp"
 using namespace std::chrono_literals;
 
 namespace semantic_segmentation_layer {
-SegmentationBuffer::SegmentationBuffer(
-    const nav2_util::LifecycleNode::WeakPtr& parent, std::string buffer_source, std::vector<std::string> class_types,
-    std::unordered_map<std::string, CostHeuristicParams> class_names_cost_map,
-    std::unordered_map<std::string, std::vector<std::string>> class_type_to_names, double observation_keep_time,
-    double expected_update_rate, double max_lookahead_distance, double min_lookahead_distance,
-    tf2_ros::Buffer& tf2_buffer, std::string global_frame, std::string sensor_frame, tf2::Duration tf_tolerance,
-    double costmap_resolution, double tile_map_decay_time, bool visualize_tile_map, bool use_cost_selection,
-    double camera_h_fov, double camera_v_fov, double camera_min_dist, double camera_max_dist,
-    double fov_inside_decay_time, double fov_outside_decay_time, bool visualize_frustum_fov)
-    : tf2_buffer_(tf2_buffer)
-    , class_types_(class_types)
-    , class_names_cost_map_(class_names_cost_map)
-    , class_type_to_names_(class_type_to_names)
-    , observation_keep_time_(rclcpp::Duration::from_seconds(observation_keep_time))
-    , expected_update_rate_(rclcpp::Duration::from_seconds(expected_update_rate))
-    , global_frame_(global_frame)
-    , sensor_frame_(sensor_frame)
-    , buffer_source_(buffer_source)
-    , sq_max_lookahead_distance_(std::pow(max_lookahead_distance, 2))
-    , sq_min_lookahead_distance_(std::pow(min_lookahead_distance, 2))
-    , tf_tolerance_(tf_tolerance)
-    , camera_h_fov_(camera_h_fov)
+SegmentationBuffer::SegmentationBuffer(const nav2_util::LifecycleNode::WeakPtr& parent,
+                                       std::string buffer_source, std::vector<std::string> class_types, std::unordered_map<std::string, CostHeuristicParams> class_names_cost_map, double observation_keep_time,
+                                       double expected_update_rate, double max_lookahead_distance,
+                                       double min_lookahead_distance, tf2_ros::Buffer& tf2_buffer,
+                                       std::string global_frame, std::string sensor_frame,
+                                       tf2::Duration tf_tolerance, double costmap_resolution, double tile_map_decay_time, bool visualize_tile_map, bool use_cost_selection,
+                                       double camera_h_fov, double camera_v_fov,
+                                       double fov_inside_decay_time, double fov_outside_decay_time, bool visualize_frustum_fov)
+  : tf2_buffer_(tf2_buffer)
+  , class_types_(class_types)
+  , class_names_cost_map_(class_names_cost_map)
+  , observation_keep_time_(rclcpp::Duration::from_seconds(observation_keep_time))
+  , expected_update_rate_(rclcpp::Duration::from_seconds(expected_update_rate))
+  , global_frame_(global_frame)
+  , sensor_frame_(sensor_frame)
+  , buffer_source_(buffer_source)
+  , sq_max_lookahead_distance_(std::pow(max_lookahead_distance, 2))
+  , sq_min_lookahead_distance_(std::pow(min_lookahead_distance, 2))
+  , tf_tolerance_(tf_tolerance)
+  , camera_h_fov_(camera_h_fov)
     , camera_v_fov_(camera_v_fov)
-    , camera_min_dist_(camera_min_dist)
-    , camera_max_dist_(camera_max_dist)
     , fov_inside_decay_time_(fov_inside_decay_time)
     , fov_outside_decay_time_(fov_outside_decay_time)
-    , ground_fov_checker_(camera_h_fov, camera_v_fov, camera_min_dist, camera_max_dist)  // On init: 2D FOV checker
+    , ground_fov_checker_(camera_h_fov, camera_v_fov, max_lookahead_distance)
 {
-    auto node = parent.lock();
-    clock_ = node->get_clock();
-    logger_ = node->get_logger();
-    last_updated_ = node->now();
-    temporal_tile_map_ = std::make_shared<SegmentationTileMap>(costmap_resolution, tile_map_decay_time);
-    visualize_tile_map_ = visualize_tile_map;
-    use_cost_selection_ = use_cost_selection;
+  auto node = parent.lock();
+  clock_ = node->get_clock();
+  logger_ = node->get_logger();
+  last_updated_ = node->now();
+  temporal_tile_map_ = std::make_shared<SegmentationTileMap>(costmap_resolution, tile_map_decay_time);
+  visualize_tile_map_ = visualize_tile_map;
+  use_cost_selection_ = use_cost_selection;
     RCLCPP_INFO(logger_, "SegmentationBuffer [%s]: Selection method = %s", buffer_source_.c_str(),
-                use_cost_selection_ ? "COST-BASED (max_cost)" : "CONFIDENCE-BASED");
-    visualize_frustum_fov_ = visualize_frustum_fov;
+              use_cost_selection_ ? "COST-BASED (max_cost)" : "CONFIDENCE-BASED");
+  visualize_frustum_fov_ = visualize_frustum_fov;
     if (visualize_frustum_fov_)
     {
         frustum_fov_pub_ = node->create_publisher<visualization_msgs::msg::Marker>(buffer_source + "/frustum_fov", 1);
     }
     if (visualize_tile_map_)
-    {
+  {
         tile_map_pub_ = node->create_publisher<sensor_msgs::msg::PointCloud2>(buffer_source + "/tile_map", 1);
-    }
+  }
 }
 
 SegmentationBuffer::~SegmentationBuffer() {}
@@ -109,13 +105,11 @@ void SegmentationBuffer::createSegmentationCostMultimap(const vision_msgs::msg::
     for (const auto& semantic_class : label_info.class_map)
     {
         const auto& name = semantic_class.class_name;
-        if (class_names_cost_map_.find(name) == class_names_cost_map_.end())
-        {
-            RCLCPP_ERROR(logger_,
-                         "CRITICAL ERROR: Class '%s' from label_info is not defined in the costmap parameters! This "
-                         "class will be ignored.",
-                         name.c_str());
-            continue;
+        if (class_names_cost_map_.find(name) == class_names_cost_map_.end()) {
+          // RCLCPP_INFO(logger_,
+          //   "CRITICAL ERROR: Class '%s' from label_info is not defined in the costmap parameters! This class will be ignored.",
+          //   name.c_str());
+          continue;
         }
         class_to_id_map[name] = semantic_class.class_id;
     }
@@ -142,20 +136,20 @@ void SegmentationBuffer::bufferSegmentation(const sensor_msgs::msg::PointCloud2&
         local_origin.point.y = 0;
         local_origin.point.z = 0;
         tf2_buffer_.transform(local_origin, global_origin, global_frame_, tf_tolerance_);
-        // Each costmap update cycle, after getting TF: update 2D FOV checker pose in global frame
+
+    // FOV path: update ground polygon and optional frustum marker when outside decay is enabled
+    if (fov_outside_decay_time_ > 0.0) {
         geometry_msgs::msg::TransformStamped cam_tf =
             tf2_buffer_.lookupTransform(global_frame_, origin_frame, cloud.header.stamp, tf_tolerance_);
         geometry_msgs::msg::Point frustum_origin;
         frustum_origin.x = global_origin.point.x;
         frustum_origin.y = global_origin.point.y;
         frustum_origin.z = global_origin.point.z;
-
         ground_fov_checker_.updatePose(frustum_origin, cam_tf.transform.rotation);
-        
-        std::vector<geometry_msgs::msg::Point> polygon = ground_fov_checker_.getGroundPolygonForVisualization();
 
         if (visualize_frustum_fov_ && frustum_fov_pub_)
         {
+            std::vector<geometry_msgs::msg::Point> polygon = ground_fov_checker_.getGroundPolygonForVisualization();
             visualization_msgs::msg::Marker marker;
             marker.header.frame_id = global_frame_;
             marker.header.stamp = cloud.header.stamp;
@@ -175,13 +169,12 @@ void SegmentationBuffer::bufferSegmentation(const sensor_msgs::msg::PointCloud2&
             }
             else if (polygon.size() == 2)
             {
-                // Only 2 rays hit z=0 (other 2 "above horizon"); draw the segment so something is visible
                 marker.points.push_back(polygon[0]);
                 marker.points.push_back(polygon[1]);
             }
-            // else: 0 or 1 point -> leave points empty (frustum not visible on ground)
             frustum_fov_pub_->publish(marker);
         }
+    }
 
         sensor_msgs::msg::PointCloud2 global_frame_cloud;
 
@@ -327,17 +320,12 @@ void SegmentationBuffer::bufferSegmentation(const sensor_msgs::msg::PointCloud2&
     last_updated_ = clock_->now();
 }
 
-std::unordered_map<std::string, CostHeuristicParams> SegmentationBuffer::getClassMap() { return class_names_cost_map_; }
 
-std::vector<std::string> SegmentationBuffer::getClassNamesForType(const std::string& class_type)
+std::unordered_map<std::string, CostHeuristicParams> SegmentationBuffer::getClassMap()
 {
-    auto it = class_type_to_names_.find(class_type);
-    if (it != class_type_to_names_.end())
-    {
-        return it->second;
-    }
-    return std::vector<std::string>();
+  return class_names_cost_map_;
 }
+
 
 void SegmentationBuffer::updateClassMap(std::string new_class, CostHeuristicParams new_cost)
 {

@@ -39,9 +39,10 @@
 #ifndef SEMANTIC_SEGMENTATION_LAYER__SEGMENTATION_BUFFER_HPP_
 #define SEMANTIC_SEGMENTATION_LAYER__SEGMENTATION_BUFFER_HPP_
 
+#include <list>
 #include <algorithm>
 #include <cmath>
-#include <list>
+#include <utility>
 #include <optional>
 #include <string>
 #include <vector>
@@ -105,14 +106,16 @@ struct TileWorldXY
 
 /**
  * @brief 2D ground-plane FOV checker for points at z=0.
- * Four corner rays → intersection with plane z=0. If intersection distance is outside [min_d, max_d],
- * substitutes the point at min_d or max_d along the ray (xy footprint). Always 4 vertices, ordered CCW.
+ * Four corner rays → footprint on z=0. Along each ray, distance is capped by an effective max range:
+ * if both upper corner rays (sv=+1 in local build order) hit z=0, that cap is
+ * min(max_lookahead_distance, min(t_upper0, t_upper1)); otherwise max_lookahead_distance.
+ * Along each ray: use z=0 intersection when valid, else clamp at frustum_end_dist.
  */
 class GroundPlaneFOVChecker
 {
-   public:
-    GroundPlaneFOVChecker(double hFOV, double vFOV, double min_dist, double max_dist)
-        : hFOV_(hFOV), vFOV_(vFOV), min_d_(min_dist), max_d_(max_dist)
+public:
+    GroundPlaneFOVChecker(double hFOV, double vFOV, double max_range)
+        : hFOV_(hFOV), vFOV_(vFOV), max_range_(max_range)
     {
         buildLocalRays();
     }
@@ -153,20 +156,18 @@ class GroundPlaneFOVChecker
         double x, y;
     };
 
-    double hFOV_, vFOV_, min_d_, max_d_;
+    double hFOV_, vFOV_, max_range_;
     Eigen::Vector3d position_;
     Eigen::Quaterniond orientation_;
     std::vector<Eigen::Vector3d> local_rays_;
     std::vector<Vec2D> ground_polygon_;
 
-    void buildLocalRays()
+    void buildLocalRays() // Build the four local rays that represent the four corners of the FOV
     {
         local_rays_.clear();
-        Eigen::Vector3d Z = Eigen::Vector3d::UnitZ();
-        for (int sv : {1, -1})
-        {
-            for (int sh : {1, -1})
-            {
+        Eigen::Vector3d Z = Eigen::Vector3d::UnitZ(); // Vector pointing away from the camera
+        for (int sv : {1, -1}) {
+            for (int sh : {1, -1}) {
                 Eigen::Affine3d rx(Eigen::AngleAxisd(sv * vFOV_ / 2.0, Eigen::Vector3d::UnitX()));
                 Eigen::Affine3d ry(Eigen::AngleAxisd(sh * hFOV_ / 2.0, Eigen::Vector3d::UnitY()));
                 local_rays_.push_back((rx * ry * Z).normalized());
@@ -174,41 +175,41 @@ class GroundPlaneFOVChecker
         }
     }
 
-    /** xy of origin + dist * d (footprint for clamping when intersection is out of range). */
-    static Vec2D rayPointAtDistance(const Eigen::Vector3d& origin, const Eigen::Vector3d& d_unit, double dist)
+    // Calculate the xy of the point on the ray at a given distance from the origin
+    static Vec2D rayPointAtDistance(
+        const Eigen::Vector3d& origin, const Eigen::Vector3d& d_unit, double dist)
     {
         Eigen::Vector3d p = origin + dist * d_unit;
         return Vec2D{p.x(), p.y()};
     }
 
-    /**
-     * if t < min_d use point at min_d along ray; if t > max_d use max_d;
-     */
-    Vec2D rayGroundPointClamped(const Eigen::Vector3d& origin, const Eigen::Vector3d& dir) const
+    // Find the distance along the ray to the z = 0 plane
+    static bool distanceToZ0(const Eigen::Vector3d& origin, const Eigen::Vector3d& d_unit, double& t_out)
     {
         const double eps = 1e-9;
-        Eigen::Vector3d d = dir.normalized();
+        if (d_unit.z() >= -eps) { // The ray is parallel to the plane
+            return false;
+        }
+        const double distance_to_z0 = -origin.z() / d_unit.z(); // Calculate the distance to the z = 0 plane
+        if (distance_to_z0 <= 0.0) { // The ray hits behind the origin
+            return false;
+        }
+        t_out = distance_to_z0;
+        return true;
+    }
 
-        // Horizontal / upward: no single z=0 hit in front — cap at max_d for stable quad
-        if (d.z() >= -eps)
-        {
-            return rayPointAtDistance(origin, d, max_d_);
+    // Ground xy: z=0 hit when valid, else point at frustum_end_dist along the ray.
+    static Vec2D groundHit(
+        const Eigen::Vector3d& origin, const Eigen::Vector3d& d_unit, bool hit_z0, double dist_z0,
+        double frustum_end_dist)
+    {
+        if (!hit_z0) { // If the ray does not hit the z = 0 plane, use the max distance
+            return rayPointAtDistance(origin, d_unit, frustum_end_dist);
         }
-
-        const double t = -origin.z() / d.z();  // distance along ray to z=0
-        if (t <= 0.0)
-        {
-            return rayPointAtDistance(origin, d, max_d_);
+        if (dist_z0 > frustum_end_dist) {
+            return rayPointAtDistance(origin, d_unit, frustum_end_dist);
         }
-        if (t < min_d_)
-        {
-            return rayPointAtDistance(origin, d, min_d_);
-        }
-        if (t > max_d_)
-        {
-            return rayPointAtDistance(origin, d, max_d_);
-        }
-        return Vec2D{origin.x() + t * d.x(), origin.y() + t * d.y()};
+        return rayPointAtDistance(origin, d_unit, dist_z0);
     }
 
     /** Order 4 points CCW around centroid so LINE_STRIP closes without self-intersection. */
@@ -236,18 +237,28 @@ class GroundPlaneFOVChecker
             ground_polygon_.clear();
             return;
         }
+        std::vector<Eigen::Vector3d> world_dir(4);
+        std::vector<bool> hit_z0(4);
+        std::vector<double> dist_z0(4);
+        for (size_t i = 0; i < 4u; ++i) { // Find distance to z = 0 for each ray
+            world_dir[i] = (orientation_ * local_rays_[i]).normalized();
+            hit_z0[i] = distanceToZ0(position_, world_dir[i], dist_z0[i]);
+        }
+        double frustum_end_dist = max_range_;
+        if (hit_z0[0] && hit_z0[1]) { // Upper corner rays hit z = 0, use the min of the two distances
+            frustum_end_dist = std::min(max_range_, std::min(dist_z0[0], dist_z0[1]));
+        }
         std::vector<Vec2D> candidates;
         candidates.reserve(4);
-        for (const auto& ray : local_rays_)
-        {
-            Eigen::Vector3d world_dir = orientation_ * ray;
-            candidates.push_back(rayGroundPointClamped(position_, world_dir));
+        for (size_t i = 0; i < 4u; ++i) { // Calculate the ground hit for each ray
+            candidates.push_back(groundHit(
+                position_, world_dir[i], hit_z0[i], dist_z0[i], frustum_end_dist));
         }
         ground_polygon_ = orderQuadCCW(std::move(candidates));
     }
 
     /**
-     * Point-in-polygon test. Polygon must be CCW (convex hull output).
+     * Point-in-polygon test.
      * Cross product (b-a)×(p-a): positive => point to left of edge => INSIDE.
      * cross == 0 (on edge) treated as inside for robustness.
      */
@@ -526,113 +537,113 @@ class SegmentationTileMap
    public:
     using SharedPtr = std::shared_ptr<SegmentationTileMap>;
 
-    // Define iterator types
-    using Iterator = typename std::unordered_map<TileIndex, TemporalObservationQueue>::iterator;
-    using ConstIterator = typename std::unordered_map<TileIndex, TemporalObservationQueue>::const_iterator;
+        // Define iterator types
+        using Iterator = typename std::unordered_map<TileIndex, TemporalObservationQueue>::iterator;
+        using ConstIterator = typename std::unordered_map<TileIndex, TemporalObservationQueue>::const_iterator;
 
     SegmentationTileMap(float resolution, float decay_time) : resolution_(resolution), decay_time_(decay_time)
     {
-        // 10k observations seemed to be a good estimate of the amount of data to be held for a decay time of ~5s
-        tile_map_.reserve(1e4);
-    }
+            // 10k observations seemed to be a good estimate of the amount of data to be held for a decay time of ~5s
+            tile_map_.reserve(1e4);
+        }
     SegmentationTileMap() {}
 
-    // Return iterator to the beginning of the tile_map_
-    Iterator begin() { return tile_map_.begin(); }
-    ConstIterator begin() const { return tile_map_.begin(); }
+        // Return iterator to the beginning of the tile_map_
+        Iterator begin() { return tile_map_.begin(); }
+        ConstIterator begin() const { return tile_map_.begin(); }
 
-    // Return iterator to the end of the tile_map_
-    Iterator end() { return tile_map_.end(); }
-    ConstIterator end() const { return tile_map_.end(); }
+        // Return iterator to the end of the tile_map_
+        Iterator end() { return tile_map_.end(); }
+        ConstIterator end() const { return tile_map_.end(); }
 
-    /**
-     * @brief Locks the map for exclusive access.
-     */
-    inline void lock() { lock_.lock(); }
+        /**
+         * @brief Locks the map for exclusive access.
+         */
+        inline void lock() { lock_.lock(); }
 
-    /**
-     * @brief Unlocks the map.
-     */
-    inline void unlock() { lock_.unlock(); }
+        /**
+         * @brief Unlocks the map.
+         */
+        inline void unlock() { lock_.unlock(); }
 
-    /**
-     * @brief Returns the number of elements in the map.
-     * @return The size of the map.
-     */
-    int size() { return tile_map_.size(); }
-    float getDecayTime() const { return decay_time_; }
+        /**
+         * @brief Returns the number of elements in the map.
+         * @return The size of the map.
+         */
+        int size() { return tile_map_.size(); }
+        float getDecayTime() const { return decay_time_; }
 
-    /**
-     * @brief Converts world coordinates to a TileIndex.
-     * @param x X coordinate in world space.
-     * @param y Y coordinate in world space.
-     * @return The corresponding TileIndex.
-     */
-    TileIndex worldToIndex(double x, double y) const
-    {
-        // Convert world coordinates to grid indices
-        int ix = static_cast<int>(std::floor(x / resolution_));
-        int iy = static_cast<int>(std::floor(y / resolution_));
-        return TileIndex{ix, iy};
-    }
-
-    /**
-     * @brief Converts a TileIndex to world coordinates.
-     * @param idx The index to convert.
-     * @return The world coordinates of the tile's center.
-     */
-    TileWorldXY indexToWorld(int x, int y) const
-    {
-        // Calculate the world coordinates of the center of the grid cell
-        double x_world = (static_cast<double>(x) + 0.5) * resolution_;
-        double y_world = (static_cast<double>(y) + 0.5) * resolution_;
-        return TileWorldXY{x_world, y_world};
-    }
-
-    /**
-     * @brief Adds an observation to the specified tile.
-     * @param obs The observation to add.
-     * @param idx The index of the tile.
-     * @param dominant_priority Whether this class should take immediate dominance when observed.
-     */
-    void pushObservation(TileObservation& obs, TileIndex& idx, bool dominant_priority = false)
-    {
-        auto it = tile_map_.find(idx);
-        if (it != tile_map_.end())
+        /**
+         * @brief Converts world coordinates to a TileIndex.
+         * @param x X coordinate in world space.
+         * @param y Y coordinate in world space.
+         * @return The corresponding TileIndex.
+         */
+        TileIndex worldToIndex(double x, double y) const
         {
-            // TileIndex exists, push the observation with dominance flag
-            it->second.push(obs, dominant_priority);
+            // Convert world coordinates to grid indices
+            int ix = static_cast<int>(std::floor(x / resolution_));
+            int iy = static_cast<int>(std::floor(y / resolution_));
+            return TileIndex{ix, iy};
         }
-        else
-        {
-            // TileIndex does not exist, create a new TemporalObservationQueue with decay time
-            TemporalObservationQueue& queue = tile_map_[idx];
-            queue.setDecayTime(decay_time_);
-            queue.push(obs, dominant_priority);
-        }
-    }
 
-    /**
-     * @brief Removes observations older than the decay time from all tiles.
-     * @param current_time The current time for comparison.
-     */
-    void purgeOldObservations(double current_time)
-    {
-        std::vector<TileIndex> tiles_to_remove;
-        for (auto& tile : tile_map_)
+        /**
+         * @brief Converts a TileIndex to world coordinates.
+         * @param idx The index to convert.
+         * @return The world coordinates of the tile's center.
+         */
+        TileWorldXY indexToWorld(int x, int y) const
         {
-            tile.second.purgeOld(current_time);
-            if (tile.second.empty())
+            // Calculate the world coordinates of the center of the grid cell
+            double x_world = (static_cast<double>(x) + 0.5) * resolution_;
+            double y_world = (static_cast<double>(y) + 0.5) * resolution_;
+            return TileWorldXY{x_world, y_world};
+        }
+
+        /**
+         * @brief Adds an observation to the specified tile.
+         * @param obs The observation to add.
+         * @param idx The index of the tile.
+         * @param dominant_priority Whether this class should take immediate dominance when observed.
+         */
+        void pushObservation(TileObservation& obs, TileIndex& idx, bool dominant_priority = false)
+        {
+            auto it = tile_map_.find(idx);
+            if (it != tile_map_.end())
             {
-                tiles_to_remove.emplace_back(tile.first);
+                // TileIndex exists, push the observation with dominance flag
+                it->second.push(obs, dominant_priority);
+            }
+            else
+            {
+                // TileIndex does not exist, create a new TemporalObservationQueue with decay time
+                TemporalObservationQueue& queue = tile_map_[idx];
+                queue.setDecayTime(decay_time_);
+                queue.push(obs, dominant_priority);
             }
         }
-        if (tile_map_.size() > 0)
+
+        /**
+         * @brief Removes observations older than the decay time from all tiles.
+         * @param current_time The current time for comparison.
+         */
+        void purgeOldObservations(double current_time)
+        {
+            std::vector<TileIndex> tiles_to_remove;
+            for (auto& tile : tile_map_)
+            {
+                tile.second.purgeOld(current_time);
+                if(tile.second.empty())
+                {
+                    tiles_to_remove.emplace_back(tile.first);
+                }
+            }
+            if(tile_map_.size() > 0)
             for (auto& tile : tiles_to_remove)
             {
                 tile_map_.erase(tile);
             }
-    }
+        }
 };
 
 /**
@@ -664,10 +675,12 @@ sensor_msgs::msg::PointCloud2 visualizeTemporalTileMap(SegmentationTileMap& tile
 
     // Define fields for PointCloud2
     sensor_msgs::PointCloud2Modifier modifier(cloud);
-    modifier.setPointCloud2Fields(
-        6, "x", 1, sensor_msgs::msg::PointField::FLOAT32, "y", 1, sensor_msgs::msg::PointField::FLOAT32, "z", 1,
-        sensor_msgs::msg::PointField::FLOAT32, "confidence", 1, sensor_msgs::msg::PointField::FLOAT32, "confidence_sum",
-        1, sensor_msgs::msg::PointField::FLOAT32, "class", 1, sensor_msgs::msg::PointField::UINT8);
+    modifier.setPointCloud2Fields(6, "x", 1, sensor_msgs::msg::PointField::FLOAT32,
+                                     "y", 1, sensor_msgs::msg::PointField::FLOAT32,
+                                     "z", 1, sensor_msgs::msg::PointField::FLOAT32,
+                                     "confidence", 1, sensor_msgs::msg::PointField::FLOAT32,
+                                     "confidence_sum", 1, sensor_msgs::msg::PointField::FLOAT32,
+                                     "class", 1, sensor_msgs::msg::PointField::UINT8);
 
     // Reserve space for points
     std::vector<PointData> points;
@@ -707,12 +720,7 @@ sensor_msgs::msg::PointCloud2 visualizeTemporalTileMap(SegmentationTileMap& tile
         *iter_confidence = point.confidence;
         *iter_confidence_sum = point.confidence_sum;
         *iter_class = point.class_id;
-        ++iter_x;
-        ++iter_y;
-        ++iter_z;
-        ++iter_confidence;
-        ++iter_confidence_sum;
-        ++iter_class;
+        ++iter_x; ++iter_y; ++iter_z; ++iter_confidence;++iter_confidence_sum; ++iter_class;
     }
 
     return cloud;
@@ -724,7 +732,7 @@ sensor_msgs::msg::PointCloud2 visualizeTemporalTileMap(SegmentationTileMap& tile
  */
 class SegmentationCostMultimap
 {
-   public:
+public:
     using SharedPtr = std::shared_ptr<SegmentationCostMultimap>;
     SegmentationCostMultimap() {}
     /**
@@ -827,7 +835,7 @@ class SegmentationCostMultimap
         return name_to_id_.empty() || id_to_cost_.empty();
     }
 
-   private:
+private:
     mutable std::mutex mutex_;  // mutable allows locking in const methods
     std::unordered_map<std::string, uint8_t> name_to_id_;
     std::unordered_map<uint8_t, CostHeuristicParams> id_to_cost_;
@@ -870,14 +878,12 @@ class SegmentationBuffer
     SegmentationBuffer(const nav2_util::LifecycleNode::WeakPtr& parent, std::string buffer_source,
                        std::vector<std::string> class_types,
                        std::unordered_map<std::string, CostHeuristicParams> class_names_cost_map,
-                       std::unordered_map<std::string, std::vector<std::string>> class_type_to_names,
                        double observation_keep_time, double expected_update_rate, double max_lookahead_distance,
                        double min_lookahead_distance, tf2_ros::Buffer& tf2_buffer, std::string global_frame,
                        std::string sensor_frame, tf2::Duration tf_tolerance, double costmap_resolution,
-                       double tile_map_decay_time, bool visualize_tile_map = false, bool use_cost_selection = true,
-                       double camera_h_fov = 1.52, double camera_v_fov = 1.01, double camera_min_dist = 0.0,
-                       double camera_max_dist = 8.0, double fov_inside_decay_time = 5.0,
-                       double fov_outside_decay_time = 5.0, bool visualize_frustum_fov = false);
+                       double tile_map_decay_time, bool visualize_tile_map, bool use_cost_selection,
+                       double camera_h_fov, double camera_v_fov,
+                       double fov_inside_decay_time, double fov_outside_decay_time, bool visualize_frustum_fov);
 
     /**
      * @brief  Destructor... cleans up
@@ -936,13 +942,6 @@ class SegmentationBuffer
     std::string getBufferSource() { return buffer_source_; }
     std::vector<std::string> getClassTypes() { return class_types_; }
 
-    /**
-     * @brief Get class names for a specific class type
-     * @param class_type The class type to get names for
-     * @return Vector of class names for the given type
-     */
-    std::vector<std::string> getClassNamesForType(const std::string& class_type);
-
     void setMinObstacleDistance(double distance) { sq_min_lookahead_distance_ = pow(distance, 2); }
 
     void setMaxObstacleDistance(double distance) { sq_max_lookahead_distance_ = pow(distance, 2); }
@@ -972,7 +971,6 @@ class SegmentationBuffer
     tf2_ros::Buffer& tf2_buffer_;
     std::vector<std::string> class_types_;
     std::unordered_map<std::string, CostHeuristicParams> class_names_cost_map_;
-    std::unordered_map<std::string, std::vector<std::string>> class_type_to_names_;
     const rclcpp::Duration observation_keep_time_;
     const rclcpp::Duration expected_update_rate_;
     rclcpp::Time last_updated_;
@@ -995,18 +993,11 @@ class SegmentationBuffer
     // If true, select observation per tile using highest max_cost. If false, use highest confidence
     bool use_cost_selection_ = true;
 
-    // 2D ground FOV only (GroundPlaneFOVChecker); no 3D frustum
     double camera_h_fov_;
     double camera_v_fov_;
-    double camera_min_dist_;
-    double camera_max_dist_;
     double fov_inside_decay_time_;
     double fov_outside_decay_time_;
     GroundPlaneFOVChecker ground_fov_checker_;
-    // For throttled FOV logging (every 100 observations) and frustum coords
-    double last_frustum_origin_x_ = 0.0;
-    double last_frustum_origin_y_ = 0.0;
-    double last_frustum_origin_z_ = 0.0;
 };
 }  // namespace semantic_segmentation_layer
 #endif  // SEMANTIC_SEGMENTATION_LAYER__SEGMENTATION_BUFFER_HPP_
