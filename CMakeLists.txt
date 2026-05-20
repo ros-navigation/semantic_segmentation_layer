@@ -23,6 +23,7 @@ find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(tf2_sensor_msgs REQUIRED)
+find_package(visualization_msgs REQUIRED)
 find_package(vision_msgs REQUIRED)
 
 # Include directories
@@ -52,6 +53,7 @@ target_link_libraries(semantic_segmentation_layer
     tf2::tf2
     tf2_ros::tf2_ros
     tf2_sensor_msgs::tf2_sensor_msgs
+    ${visualization_msgs_TARGETS}
     ${vision_msgs_TARGETS}
 )
 
