@@ -194,6 +194,7 @@ class SemanticSegmentationLayer : public nav2_costmap_2d::CostmapLayer
     bool rolling_window_;
     bool was_reset_;
     bool use_approximate_time_sync_;
+    int sensor_data_depth_;
     int combination_method_;
 };
 
