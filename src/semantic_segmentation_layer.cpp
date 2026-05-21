@@ -75,10 +75,12 @@ void SemanticSegmentationLayer::onInitialize()
   declareParameter("observation_sources", rclcpp::ParameterValue(std::string("")));
   declareParameter("publish_debug_topics", rclcpp::ParameterValue(false));
   declareParameter("use_approximate_time_sync", rclcpp::ParameterValue(true));
+  declareParameter("sensor_data_depth", rclcpp::ParameterValue(10));
 
   node->get_parameter(name_ + "." + "enabled", enabled_);
   node->get_parameter(name_ + "." + "combination_method", combination_method_);
   node->get_parameter(name_ + "." + "use_approximate_time_sync", use_approximate_time_sync_);
+  node->get_parameter(name_ + "." + "sensor_data_depth", sensor_data_depth_);
   node->get_parameter("track_unknown_space", track_unknown_space);
   node->get_parameter("transform_tolerance", transform_tolerance);  
 
@@ -180,7 +182,7 @@ void SemanticSegmentationLayer::onInitialize()
     auto sub_opt = rclcpp::SubscriptionOptions();
     sub_opt.callback_group = callback_group_;
     rmw_qos_profile_t custom_qos_profile = rmw_qos_profile_sensor_data;
-    custom_qos_profile.depth = 50;
+    custom_qos_profile.depth = sensor_data_depth_;
 
     // label info subscription
     rclcpp::SubscriptionOptionsWithAllocator<std::allocator<void>> tl_sub_opt;
@@ -217,7 +219,7 @@ void SemanticSegmentationLayer::onInitialize()
     pointcloud_subs_.push_back(pointcloud_sub);
 
     auto pointcloud_tf_sub = std::make_shared<tf2_ros::MessageFilter<sensor_msgs::msg::PointCloud2>>(
-      *pointcloud_subs_.back(), *tf_, global_frame_, 50,
+      *pointcloud_subs_.back(), *tf_, global_frame_, sensor_data_depth_,
       node->get_node_logging_interface(),
       node->get_node_clock_interface(),
       tf2::durationFromSec(transform_tolerance));
@@ -233,7 +235,7 @@ void SemanticSegmentationLayer::onInitialize()
       if (use_approximate_time_sync_)
       {
         auto segm_conf_pc_approx_sync = std::make_shared<ApproxSync3>(
-          ApproxSyncPolicy3(1000),
+          ApproxSyncPolicy3(sensor_data_depth_),
           *semantic_segmentation_subs_.back(), *semantic_segmentation_confidence_subs_.back(),
           *pointcloud_tf_subs_.back());
         segm_conf_pc_approx_sync->setMaxIntervalDuration(rclcpp::Duration(0, 100000000));
@@ -250,7 +252,7 @@ void SemanticSegmentationLayer::onInitialize()
       {
         auto segm_conf_pc_sync = std::make_shared<ExactSync3>(
           *semantic_segmentation_subs_.back(), *semantic_segmentation_confidence_subs_.back(),
-          *pointcloud_tf_subs_.back(), 1000);
+          *pointcloud_tf_subs_.back(), sensor_data_depth_);
         segm_conf_pc_sync->registerCallback(std::bind(
           &SemanticSegmentationLayer::syncSegmConfPointcloudCb, this,
           std::placeholders::_1, std::placeholders::_2,
@@ -267,7 +269,7 @@ void SemanticSegmentationLayer::onInitialize()
       if (use_approximate_time_sync_)
       {
         auto segm_pc_approx_sync = std::make_shared<ApproxSync2>(
-          ApproxSyncPolicy2(1000),
+          ApproxSyncPolicy2(sensor_data_depth_),
           *semantic_segmentation_subs_.back(), *pointcloud_tf_subs_.back());
         segm_pc_approx_sync->setMaxIntervalDuration(rclcpp::Duration(0, 100000000));
         segm_pc_approx_sync->registerCallback(std::bind(
@@ -278,7 +280,7 @@ void SemanticSegmentationLayer::onInitialize()
       else
       {
         auto segm_pc_sync = std::make_shared<ExactSync2>(
-          *semantic_segmentation_subs_.back(), *pointcloud_tf_subs_.back(), 1000);
+          *semantic_segmentation_subs_.back(), *pointcloud_tf_subs_.back(), sensor_data_depth_);
         segm_pc_sync->registerCallback(std::bind(
           &SemanticSegmentationLayer::syncSegmPointcloudCb, this,
           std::placeholders::_1, std::placeholders::_2, segmentation_buffers_.back()));
